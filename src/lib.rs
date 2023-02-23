@@ -1,5 +1,37 @@
 //! `TransientMap` acts as a wrapper for `std::collections::HashMap` which allows for
-//! the eviction of unused elements.
+//! the eviction of unused elements. In addition to the standard hashmap API, it provides
+//! the following extra functions:
+//! 
+//! - `drain_unused` removes all of the elements that have not been inserted or accessed
+//! since the previous drain call, returning the elements as an iterator. The entirety of
+//! the drain operation takes `O(unused elements)` time. Note that this is faster
+//! than the amount of time required to iterate over the entire map, which is `O(capacity)`.
+//! - `drain_used` removes all of the elements that have been inserted or accessed since
+//! the last drain call. The entirety of the drain operation takes `O(used elements)` time.
+//! - `set_all_used` marks all elements as having been accessed in `O(1)` time.
+//! - `set_all_unused` marks all elements as not having been accessed in `O(1)` time.
+//! 
+//! These additional functions make `TransientMap` an ideal choice for applications like
+//! caching, where it is desirable to efficiently discard data that has not been used.
+//! 
+//! The following is a brief example of how to use `TransientMap`:
+//! 
+//! ```
+//! # use transient_map::*;
+//! let mut map = TransientMap::new();
+//! map.insert_unused(1, "a");
+//! map.insert_unused(2, "b");
+//! assert_eq!(Some("b"), map.remove(&2));
+//! map.insert(3, "c");
+//! map.insert(4, "d");
+//! assert_eq!(vec!((1, "a")), map.drain_unused().collect::<Vec<_>>());
+//! 
+//! let mut res = map.drain_unused().collect::<Vec<_>>();
+//! res.sort_by(|a, b| a.0.cmp(&b.0));
+//! 
+//! assert_eq!(vec!((3, "c"), (4, "d")), res);
+//! assert_eq!(0, map.len());
+//! ```
 
 #![deny(warnings)]
 #![warn(missing_docs)]
@@ -13,7 +45,7 @@ use std::hash::*;
 use std::mem::*;
 use std::rc::*;
 
-/// A a hashmap wrapper which tracks used and unused entries, allowing
+/// A hashmap wrapper which tracks used and unused entries, allowing
 /// for their efficient removal.
 pub struct TransientMap<K, V, S = RandomState> {
     /// The map which stores the key-value pairs and satellite tracking data.
@@ -171,13 +203,13 @@ impl<K, V, S> TransientMap<K, V, S> {
     fn remove_item(value: &TransientMapValue<V>, tracker: &mut TransientUsageTracker<K>) -> Rc<K> {
         let idx = value.index.get();
         if idx.wrapping_add(tracker.usage_offset) < tracker.first_used {
-            Self::swap_items(idx, 0, tracker);
+            Self::swap_items(idx, 0usize.wrapping_sub(tracker.usage_offset), tracker);
             tracker.usage_offset = tracker.usage_offset.wrapping_sub(1);
+            tracker.first_used -= 1;
             tracker.item_usage.pop_front()
         }
         else {
-            Self::swap_items(idx, tracker.item_usage.len() - 1, tracker);
-            tracker.first_used -= 1;
+            Self::swap_items(idx, (tracker.item_usage.len() - 1).wrapping_sub(tracker.usage_offset), tracker);
             tracker.item_usage.pop_back()
         }.expect("The item usage deque was empty.").key
     }
@@ -202,18 +234,22 @@ where
     /// Removes all entries from the map that were not accessed since the
     /// last call to `drain_used` or `drain_unused`.
     /// 
-    /// This function takes `O(unused elements)` time.
+    /// It takes `O(unused elements)` time to iterate over the results of this call.
+    /// Like the standard `hash_map::Drain`, all elements remaining in the iterator
+    /// when it is dropped are also dropped.
     pub fn drain_unused(&mut self) -> impl '_ + Iterator<Item = (K, V)> {
-        self.tracker.usage_offset = self.tracker.usage_offset.wrapping_sub(self.tracker.first_used);
         let begin_used = self.tracker.first_used;
-        self.tracker.first_used = self.tracker.item_usage.len() - self.tracker.first_used;
+        self.tracker.first_used = self.tracker.item_usage.len() - begin_used;
+        self.tracker.usage_offset = self.tracker.usage_offset.wrapping_sub(begin_used);
         Drain { map: &mut self.map, iterator: self.tracker.item_usage.drain(..begin_used) }
     }
     
     /// Removes all entries from the map that were accessed since the
     /// last call to `drain_used` or `drain_unused`.
     /// 
-    /// This function takes `O(used elements)` time.
+    /// It takes `O(used elements)` time to iterate over the results of this call.
+    /// Like the standard `hash_map::Drain`, all elements remaining in the iterator
+    /// when it is dropped are also dropped.
     pub fn drain_used(&mut self) -> impl '_ + Iterator<Item = (K, V)> {
         Drain { map: &mut self.map, iterator: self.tracker.item_usage.drain(self.tracker.first_used..) }
     }
@@ -377,7 +413,7 @@ where
         let new_offset = self.tracker.usage_offset.wrapping_add(usage_increment);
         let usage = TransientMapItemUsage {
             key: Rc::new(k),
-            index: Rc::new(Cell::new(initial_position.wrapping_sub(self.tracker.usage_offset)))
+            index: Rc::new(Cell::new(initial_position.wrapping_sub(new_offset)))
         };
         let value = TransientMapValue {
             value: v,
@@ -392,7 +428,7 @@ where
         }        
         else {
             self.tracker.usage_offset = new_offset;
-            self.tracker.first_used += 1 - usage_increment;
+            self.tracker.first_used += usage_increment;
             pusher(&mut self.tracker.item_usage, usage);
             None
         }
@@ -488,6 +524,10 @@ where
         let value = self.map.remove(&pair.key).expect("Could not remove item from map.").value;
         Some((Rc::try_unwrap(pair.key).ok().expect("Another copy of key still existed."), value))
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iterator.size_hint()
+    }
 }
 
 impl<'a, K, V, S, I: Iterator<Item = TransientMapItemUsage<K>>> Drop for Drain<'a, K, V, S, I>
@@ -550,6 +590,7 @@ impl<'a, K: 'a, V: 'a> VacantEntry<'a, K, V> {
         };
 
         self.tracker.usage_offset = new_offset;
+        self.tracker.first_used += 1;
         self.tracker.item_usage.push_front(usage);
         &mut self.inner.insert(value).value
     }
@@ -756,6 +797,31 @@ mod tests {
         map.insert(1, "a");
         drop(map.drain_unused());
         drop(map.drain_unused());
+        assert_eq!(0, map.len());
+    }
+    
+    #[test]
+    pub fn test_insert_unused() {
+        let mut map = TransientMap::new();
+        map.insert(1, "a");
+        map.insert_unused(2, "b");
+        assert_eq!(vec!((2, "b")), map.drain_unused().collect::<Vec<_>>());
+    }
+
+    #[test]
+    pub fn test_add_remove_drop() {
+        let mut map = TransientMap::new();
+        map.insert_unused(1, "a");
+        map.insert_unused(2, "b");
+        assert_eq!(Some("b"), map.remove(&2));
+        map.insert(3, "c");
+        map.insert(4, "d");
+        assert_eq!(vec!((1, "a")), map.drain_unused().collect::<Vec<_>>());
+        
+        let mut res = map.drain_unused().collect::<Vec<_>>();
+        res.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(vec!((3, "c"), (4, "d")), res);
         assert_eq!(0, map.len());
     }
 }
