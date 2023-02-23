@@ -21,7 +21,7 @@ caching, where it is desirable to efficiently discard data that has not been use
 
 The following is a brief example of how to use `TransientMap`:
 
-```rustc
+```rust
 let mut map = TransientMap::new();
 map.insert_unused(1, "a");
 map.insert_unused(2, "b");
