@@ -609,14 +609,6 @@ where
 {
 }
 
-unsafe impl<K, V, S> Sync for TransientMap<K, V, S>
-where
-    K: Sync,
-    V: Sync,
-    S: Sync,
-{
-}
-
 /// A draining iterator over the entries of a `TransientMap`.
 struct Drain<'a, K, V, S, I: Iterator<Item = TransientMapItemUsage<K>>>
 where
