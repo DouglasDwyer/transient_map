@@ -51,7 +51,7 @@ pub struct TransientMap<K, V, S = RandomState> {
     /// The map which stores the key-value pairs and satellite tracking data.
     map: HashMap<Rc<K>, TransientMapValue<V>, S>,
     /// The tracker that stores information about which items are used and unused.
-    tracker: TransientUsageTracker<K>
+    tracker: RefCell<TransientUsageTracker<K>>
 }
 
 impl<K, V> TransientMap<K, V, RandomState> {
@@ -70,13 +70,14 @@ impl<K, V, S> TransientMap<K, V, S> {
     /// Marks all entries as used. They will not be included
     /// in the next `drain_unused` call. This function is `O(1)`.
     pub fn set_all_used(&mut self) {
-        self.tracker.first_used = 0;
+        self.tracker.get_mut().first_used = 0;
     }
 
     /// Marks all entries as unused. They will be included in the
     /// next `drain_unused` call. This function is `O(1)`.
     pub fn set_all_unused(&mut self) {
-        self.tracker.first_used = self.tracker.item_usage.len();
+        let tracker = self.tracker.get_mut();
+        tracker.first_used = tracker.item_usage.len();
     }
 
     /// Creates an empty `TransientMap` with at least the specified capacity, using
@@ -84,13 +85,19 @@ impl<K, V, S> TransientMap<K, V, S> {
     pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> Self {
         Self {
             map: HashMap::with_capacity_and_hasher(capacity, hasher),
-            tracker: TransientUsageTracker { first_used: 0, item_usage: VecDeque::new(), usage_offset: 0 }
+            tracker: RefCell::new(TransientUsageTracker { first_used: 0, item_usage: VecDeque::new(), usage_offset: 0 })
         }
     }
 
     /// Returns the number of elements the map can hold without reallocating.
     pub fn capacity(&self) -> usize {
         self.map.capacity()
+    }
+
+    /// An iterator visiting all keys in arbitrary order.
+    /// The iterator element type is `&'a K`.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(k, _)| k)
     }
 
     /// An iterator visiting all keys in arbitrary order.
@@ -105,6 +112,15 @@ impl<K, V, S> TransientMap<K, V, S> {
     /// The iterator element type is `K`.
     pub fn into_keys(self) -> impl Iterator<Item = K> {
         self.map.into_keys().map(|k| Rc::try_unwrap(k).ok().expect("Another reference to the key still existed."))
+    }
+
+    /// An iterator visiting all values in arbitrary order.
+    /// The iterator element type is `&'a V`.
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.map.values().map(|v| {
+            Self::promote_item(v, &mut self.tracker.borrow_mut());
+            &v.value
+        })
     }
 
     /// An iterator visiting all values in arbitrary order.
@@ -128,6 +144,15 @@ impl<K, V, S> TransientMap<K, V, S> {
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
+    /// The iterator element type is `(&'a K, &'a V)`.
+    pub fn iter(&self) -> impl '_ + Iterator<Item = (&K, &V)> {
+        self.map.iter().map(|(k, v)| {
+            Self::promote_item(v, &mut self.tracker.borrow_mut());
+            (&**k, &v.value)
+        })
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order.
     /// The iterator element type is `(&'a K, &'a V)`. The iterator visits
     /// all keys silently, meaning that nothing is marked as used.
     pub fn iter_silent(&self) -> impl '_ + Iterator<Item = (&K, &V)> {
@@ -139,7 +164,7 @@ impl<K, V, S> TransientMap<K, V, S> {
     /// The iterator element type is `(&'a K, &'a mut V)`.
     pub fn iter_mut(&mut self) -> impl '_ + Iterator<Item = (&K, &mut V)> {
         self.map.iter_mut().map(|(k, v)| {
-            Self::promote_item(v, &mut self.tracker);
+            Self::promote_item(v, self.tracker.get_mut());
             (&**k, &mut v.value)
         })
     }
@@ -161,9 +186,10 @@ impl<K, V, S> TransientMap<K, V, S> {
     /// drops the remaining key-value pairs. The returned iterator keeps a
     /// mutable borrow on the map to optimize its implementation.
     pub fn drain(&mut self) -> impl '_ + Iterator<Item = (K, V)> {
-        self.tracker.first_used = 0;
-        self.tracker.usage_offset = 0;
-        self.tracker.item_usage.clear();
+        let tracker = self.tracker.get_mut();
+        tracker.first_used = 0;
+        tracker.usage_offset = 0;
+        tracker.item_usage.clear();
         self.map.drain().map(|(k, v)| (Rc::try_unwrap(k).ok().expect("Another reference was still out to the stored key."), v.value))
     }
 
@@ -171,9 +197,10 @@ impl<K, V, S> TransientMap<K, V, S> {
     /// for reuse.
     pub fn clear(&mut self) {
         self.map.clear();
-        self.tracker.first_used = 0;
-        self.tracker.usage_offset = 0;
-        self.tracker.item_usage.clear();
+        let tracker = self.tracker.get_mut();
+        tracker.first_used = 0;
+        tracker.usage_offset = 0;
+        tracker.item_usage.clear();
     }
 
     /// Returns a reference to the map's [`BuildHasher`].
@@ -238,10 +265,11 @@ where
     /// Like the standard `hash_map::Drain`, all elements remaining in the iterator
     /// when it is dropped are also dropped.
     pub fn drain_unused(&mut self) -> impl '_ + Iterator<Item = (K, V)> {
-        let begin_used = self.tracker.first_used;
-        self.tracker.first_used = self.tracker.item_usage.len() - begin_used;
-        self.tracker.usage_offset = self.tracker.usage_offset.wrapping_sub(begin_used);
-        Drain { map: &mut self.map, iterator: self.tracker.item_usage.drain(..begin_used) }
+        let tracker = self.tracker.get_mut();
+        let begin_used = tracker.first_used;
+        tracker.first_used = tracker.item_usage.len() - begin_used;
+        tracker.usage_offset = tracker.usage_offset.wrapping_sub(begin_used);
+        Drain { map: &mut self.map, iterator: tracker.item_usage.drain(..begin_used) }
     }
     
     /// Removes all entries from the map that were accessed since the
@@ -251,7 +279,8 @@ where
     /// Like the standard `hash_map::Drain`, all elements remaining in the iterator
     /// when it is dropped are also dropped.
     pub fn drain_used(&mut self) -> impl '_ + Iterator<Item = (K, V)> {
-        Drain { map: &mut self.map, iterator: self.tracker.item_usage.drain(self.tracker.first_used..) }
+        let first = self.tracker.get_mut().first_used;
+        Drain { map: &mut self.map, iterator: self.tracker.get_mut().item_usage.drain(first..) }
     }
 
     /// Reserves capacity for at least `additional` more elements to be inserted
@@ -261,7 +290,7 @@ where
     /// Does nothing if capacity is already sufficient.
     pub fn reserve(&mut self, additional: usize) {
         self.map.reserve(additional);
-        self.tracker.item_usage.reserve(additional);
+        self.tracker.get_mut().item_usage.reserve(additional);
     }
 
     /// Retains only the elements specified by the predicate. Because the predicate
@@ -275,10 +304,10 @@ where
     {
         for (k, v) in &mut self.map {
             if f(&**k, &mut v.value) {
-                Self::promote_item(v, &mut self.tracker);
+                Self::promote_item(v, self.tracker.get_mut());
             }
             else {
-                Self::demote_item(v, &mut self.tracker);
+                Self::demote_item(v, self.tracker.get_mut());
             }
         }
         drop(self.drain_unused());
@@ -291,7 +320,7 @@ where
     /// it returns `Ok(())`.
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
         self.map.try_reserve(additional)?;
-        self.tracker.item_usage.try_reserve(additional)?;
+        self.tracker.get_mut().item_usage.try_reserve(additional)?;
         Ok(())
     }
 
@@ -300,7 +329,7 @@ where
     /// and possibly leaving some space in accordance with the resize policy.
     pub fn shrink_to_fit(&mut self) {
         self.map.shrink_to_fit();
-        self.tracker.item_usage.shrink_to_fit();
+        self.tracker.get_mut().item_usage.shrink_to_fit();
     }
 
     /// Shrinks the capacity of the map with a lower limit. It will drop
@@ -308,7 +337,7 @@ where
     /// and possibly leaving some space in accordance with the resize policy.
     pub fn shrink_to(&mut self, min_capacity: usize) {
         self.map.shrink_to(min_capacity);
-        self.tracker.item_usage.shrink_to(min_capacity);
+        self.tracker.get_mut().item_usage.shrink_to(min_capacity);
     }
 
     /// Gets the given key's corresponding entry in the map for in-place manipulation.
@@ -316,13 +345,22 @@ where
         match self.map.entry(Rc::new(key)) {
             hash_map::Entry::Vacant(e) => Entry::Vacant(VacantEntry {
                 inner: e,
-                tracker: &mut self.tracker
+                tracker: self.tracker.get_mut()
             }),
             hash_map::Entry::Occupied(e) => Entry::Occupied(OccupiedEntry {
                 inner: e,
-                tracker: &mut self.tracker
+                tracker: self.tracker.get_mut()
             }),
         }
+    }
+
+    /// Returns a reference to the value corresponding to the key.
+    pub fn get<Q: ?Sized>(&self, k: &Q) -> Option<&V>
+    where
+        Rc<K>: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.get_key_value(k).map(|(_, v)| v)
     }
 
     /// Returns a reference to the value corresponding to the key. This accesses
@@ -333,6 +371,18 @@ where
         Q: Hash + Eq,
     {
         self.get_key_value_silent(k).map(|(_, v)| v)
+    }
+
+    /// Returns the key-value pair corresponding to the supplied key.
+    pub fn get_key_value<Q: ?Sized>(&self, k: &Q) -> Option<(&K, &V)>
+    where
+        Rc<K>: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.map.get_key_value(k).map(|(k, h)| {
+            Self::promote_item(h, &mut self.tracker.borrow_mut());
+            (&**k, &h.value)
+        })
     }
 
     /// Returns the key-value pair corresponding to the supplied key. This accesses
@@ -362,7 +412,7 @@ where
         Q: Hash + Eq,
     {
         self.map.get_mut(k).map(|value| {
-            Self::promote_item(value, &mut self.tracker);
+            Self::promote_item(value, self.tracker.get_mut());
             &mut value.value
         })
     }
@@ -370,7 +420,8 @@ where
     /// Inserts a key-value pair into the map. The inserted key
     /// is automatically treated as used.
     pub fn insert(&mut self, k: K, v: V) -> Option<V> {
-        self.insert_with_mover(k, v, self.tracker.item_usage.len(), 0, Self::promote_item, VecDeque::push_back)
+        let initial_position = self.tracker.get_mut().item_usage.len();
+        self.insert_with_mover(k, v, initial_position, 0, Self::promote_item, VecDeque::push_back)
     }
     
 
@@ -398,7 +449,7 @@ where
         Q: Hash + Eq,
     {
         if let Some(prev) = self.map.remove(k) {
-            let key = Self::remove_item(&prev, &mut self.tracker);
+            let key = Self::remove_item(&prev, self.tracker.get_mut());
             Some((Rc::try_unwrap(key).ok().expect("Another reference was still out to the stored key."), prev.value))
         }
         else {
@@ -410,7 +461,8 @@ where
     /// to select an initial position for the usage tracker. Returns the old element if it
     /// already existed.
     fn insert_with_mover(&mut self, k: K, v: V, initial_position: usize, usage_increment: usize, mover: impl Fn(&TransientMapValue<V>, &mut TransientUsageTracker<K>), pusher: impl Fn(&mut VecDeque<TransientMapItemUsage<K>>, TransientMapItemUsage<K>)) -> Option<V> {
-        let new_offset = self.tracker.usage_offset.wrapping_add(usage_increment);
+        let tracker = self.tracker.get_mut();
+        let new_offset = tracker.usage_offset.wrapping_add(usage_increment);
         let usage = TransientMapItemUsage {
             key: Rc::new(k),
             index: Rc::new(Cell::new(initial_position.wrapping_sub(new_offset)))
@@ -421,15 +473,15 @@ where
         };
         
         if let Some(prev) = self.map.insert(usage.key.clone(), value) {
-            mover(&prev, &mut self.tracker);
+            mover(&prev, tracker);
             usage.index.set(prev.index.get());
-            self.tracker.item_usage[prev.index.get().wrapping_add(self.tracker.usage_offset)] = usage;
+            tracker.item_usage[prev.index.get().wrapping_add(tracker.usage_offset)] = usage;
             Some(prev.value)
         }        
         else {
-            self.tracker.usage_offset = new_offset;
-            self.tracker.first_used += usage_increment;
-            pusher(&mut self.tracker.item_usage, usage);
+            tracker.usage_offset = new_offset;
+            tracker.first_used += usage_increment;
+            pusher(&mut tracker.item_usage, usage);
             None
         }
     }
@@ -442,7 +494,8 @@ where
     S: Clone,
 {
     fn clone(&self) -> Self {
-        Self { map: self.map.clone(), tracker: TransientUsageTracker { first_used: self.tracker.first_used, item_usage: self.tracker.item_usage.clone(), usage_offset: self.tracker.usage_offset } }
+        let tracker = self.tracker.borrow();
+        Self { map: self.map.clone(), tracker: RefCell::new(TransientUsageTracker { first_used: tracker.first_used, item_usage: tracker.item_usage.clone(), usage_offset: tracker.usage_offset }) }
     }
 }
 
@@ -451,7 +504,7 @@ where
     S: Default
 {
     fn default() -> Self {
-        Self { map: HashMap::default(), tracker: TransientUsageTracker { first_used: 0, item_usage: VecDeque::new(), usage_offset: 0 } }
+        Self { map: HashMap::default(), tracker: RefCell::new(TransientUsageTracker { first_used: 0, item_usage: VecDeque::new(), usage_offset: 0 }) }
     }
 }
 
@@ -539,6 +592,47 @@ where
         for pair in &mut self.iterator {
             self.map.remove(&pair.key);
         }
+    }
+}
+
+impl<K, V, S> IntoIterator for TransientMap<K, V, S> {
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter { iterator: self.map.into_iter() }
+    }
+}
+
+impl<'a, K, V, S> IntoIterator for &'a TransientMap<K, V, S> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = Box<dyn 'a + Iterator<Item = (&'a K, &'a V)>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+impl<'a, K, V, S> IntoIterator for &'a mut TransientMap<K, V, S> {
+    type Item = (&'a K, &'a mut V);
+    type IntoIter = Box<dyn 'a + Iterator<Item = (&'a K, &'a mut V)>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter_mut())
+    }
+}
+
+/// An owning iterator over the entries of a `TransientMap`.
+pub struct IntoIter<K, V> {
+    /// The backing iterator from the internal hashmap.
+    iterator: hash_map::IntoIter<Rc<K>, TransientMapValue<V>>
+}
+
+impl<K, V> Iterator for IntoIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iterator.next().map(|(k, v)| (Rc::try_unwrap(k).ok().expect("Another reference to the key was still held."), v.value))
     }
 }
 
